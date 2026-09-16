@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -57,7 +58,10 @@ from app.observability import (AuditMiddleware, observe_recovery, observe_route,
 from app.credential_io import (CredentialFileError, read_import_file, atomic_write_credential,
                                credential_file_lock)
 from app.upstream_io import (ChatSSEAccumulator, UpstreamHTTPError, UpstreamResponseError,
-                             open_backend_stream, read_bounded_error)
+                             open_backend_stream, parse_retry_after, read_bounded_error)
+from app.inference_resources import (AccountCapacity, InferenceResourcesMiddleware, inference_lifespan,
+                                     request_resources, release_credential)
+from app.request_context import SessionIdentifierError, current_context
 from app.inference_auth import require_api_key
 from app.content_filter import ContentFilterDetector, is_filter_error
 from app.request_limits import ImageLimitError, apply_image_policy
@@ -463,6 +467,7 @@ class CredentialPool:
         self._blocks = ModelBlocks(blocks_path, ttl_s=MODEL_SITE_BLOCK_S, max_ttl_s=MODEL_SITE_BLOCK_MAX_S)
         self._rr = {None: 0, "cn": 0, "intl": 0}
         self._ledger = None              # Prefer credits expiring sooner.
+        self._capacity = AccountCapacity()
         self._scan = scan                # Rescan credentials before selection.
         self._ignored_duplicates: set[str] = set()
         self._sync_pending: set[str] = set()
@@ -792,8 +797,19 @@ class CredentialPool:
         healthy.sort(key=lambda entry: (not self._model_free(entry, model), *self._expiry_rank(entry)))
         return healthy
 
+    @staticmethod
+    def _capacity_error():
+        return HTTPException(status_code=503, headers={"Retry-After": "3"}, detail={"error": {
+            "message": "符合当前路由和免费优先策略的账号在途名额已满，请稍后重试",
+            "type": "service_unavailable", "code": "credential_concurrency_limit"}})
+
+    @staticmethod
+    def _capacity_key(entry):
+        return entry.get("account_key") or entry["id"]
+
+
     def pick(self, skey: str | None, model: str | None = None, *, region=None,
-             tried=()) -> CredentialManager | None:
+             tried=(), with_capacity=False) -> CredentialManager | None:
         """Select a healthy sticky or round-robin credential, preferring eligible zero-rate accounts."""
         self._rescan()  # Reload and prune acquire their own locks.
         with self._lock:
@@ -803,6 +819,13 @@ class CredentialPool:
                 if skey:
                     self._sticky.pop(skey, None)
                 return None
+            limit = CONFIG.get("max_inflight_per_account", 0)
+            if with_capacity and limit:
+                free = self._model_free(candidates[0], model)
+                candidates = [entry for entry in candidates if self._model_free(entry, model) == free
+                              and self._capacity.count(self._capacity_key(entry)) < limit]
+                if not candidates:
+                    raise self._capacity_error()
             best = candidates[0]
             free = self._model_free(best, model)
             top = [e for e in candidates if self._model_free(e, model) == free
@@ -821,10 +844,11 @@ class CredentialPool:
             return e["cm"]
 
     def headers_for(self, skey: str | None, model: str | None = None, *, region=None,
-                    with_generation=False, tried=()):
-        """Recheck the credential generation and site before sending."""
+                    with_generation=False, tried=(), with_capacity=False):
+        """Recheck identity and atomically reserve account capacity before sending."""
+        capacity_race = False
         for _ in range(max(1, len(self._entries))):
-            cm = self.pick(skey, model, region=region, tried=tried)
+            cm = self.pick(skey, model, region=region, tried=tried, with_capacity=with_capacity)
             if cm is None:
                 return None
             reason = None
@@ -843,7 +867,16 @@ class CredentialPool:
                 entry = next((entry for entry in self._entries if entry["cm"] is cm), None)
                 if (entry is not None and cm._generation == generation and self._healthy(entry)
                         and self._eligible(entry, model, region=region, profile=profile) and self._model_healthy(entry, model)):
+                    if with_capacity:
+                        lease = self._capacity.acquire(self._capacity_key(entry),
+                            CONFIG.get("max_inflight_per_account", 0), cm, generation)
+                        if lease is None:
+                            capacity_race = True
+                            continue
+                        return lease, headers
                     return ((cm, generation) if with_generation else cm), headers
+        if capacity_race:
+            raise self._capacity_error()
         return None
 
     @staticmethod
@@ -868,7 +901,7 @@ class CredentialPool:
         _log(f"[cred] 凭证熔断 {CRED_COOLDOWN}s: {Path(cm.path).name} {reason}")
 
     def note_status(self, cm: CredentialManager | None, status: int,
-                    model: str | None = None, raw: bytes = b"", *, generation=None):
+                    model: str | None = None, raw: bytes = b"", *, generation=None, retry_after=None):
         """Apply credential-wide auth cooldowns, per-model 429 cooldowns and backend/model backoff."""
         if cm is None:
             return
@@ -882,7 +915,11 @@ class CredentialPool:
         if status != 429 or not model:
             return
         now = time.time()
-        until = _parse_reset_time(raw) or now + MODEL_COOLDOWN
+        if retry_after is not None:
+            until = now + retry_after
+        else:
+            reset = _parse_reset_time(raw)
+            until = reset if reset is not None and reset > now else now + MODEL_COOLDOWN
         until = min(until, now + MODEL_COOLDOWN_MAX)
         with self._lock, (cm._lock if generation is not None else nullcontext()):
             if not self._lease_matches(cm, generation):
@@ -891,7 +928,9 @@ class CredentialPool:
             for e in self._entries:
                 if e["cm"] is cm:
                     routed_model = _upstream_model(model, self._entry_profile(e))
-                    self._model_fail[(e["id"], routed_model)] = until
+                    key = (e["id"], routed_model)
+                    until = max(until, self._model_fail.get(key, 0.0))
+                    self._model_fail[key] = until
         _log(f"[cred] 模型冷却 {model} @ {Path(cm.path).name} 至 "
              f"{time.strftime('%m-%d %H:%M:%S', time.localtime(until))} (HTTP 429)")
 
@@ -1034,6 +1073,8 @@ class CredentialPool:
             out = []
             for e in self._entries:
                 s: dict = {"auth_file": e["id"], "healthy": self._healthy(e),
+                           "in_flight": self._capacity.count(self._capacity_key(e)),
+                           "max_in_flight": CONFIG.get("max_inflight_per_account", 0),
                            "model_cooldowns": {m: time.strftime("%m-%d %H:%M:%S", time.localtime(u))
                                                for (cid, m), u in self._model_fail.items()
                                                if cid == e["id"] and u > now},
@@ -1394,7 +1435,8 @@ PASSTHROUGH_BODY_KEYS = {
 # FastAPI application
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="codebuddy2api", version=APP_VERSION)
+app = FastAPI(title="codebuddy2api", version=APP_VERSION, lifespan=inference_lifespan)
+app.add_middleware(InferenceResourcesMiddleware, config=lambda: CONFIG)
 
 # Anthropic error types: https://platform.claude.com/docs/en/api/errors
 _ANTHROPIC_ERROR_TYPES = {
@@ -1443,6 +1485,8 @@ CONFIG: dict = {"api_key": "", "cred": None, "log_path": None, "ledger": None,
                 "max_request_bytes": 32 * 1024 * 1024, "log_body_limit": 65536,
                 "max_inbound_bytes": 64 * 1024 * 1024,
                 "max_collect_bytes": 8 * 1024 * 1024, "max_concurrent": 64,
+                "upstream_keepalive": False, "max_inflight_per_account": 0,
+                "request_context_mode": "legacy",
                 "failover_max": 0,     # Credential failovers allowed before the first response byte
                 "retry_write_timeout": False,  # Opt-in replay after incomplete writes
                 "usage_daily": None,     # Usage aggregated by date and model
@@ -1529,17 +1573,22 @@ def _check_admin_auth(authorization: Optional[str], x_api_key: Optional[str]):
 
 def _cred_for(payload: dict, model: str | None = None, *, region=None, tried=()):
     """Select a fresh credential lease and headers, excluding tried accounts; report unavailable capacity."""
-    raw_key = session_key(payload)
+    context = current_context()
+    raw_key = context.session_key if context is not None and context.scoped else session_key(payload)
     skey = f"{region}:{raw_key}" if raw_key and region is not None else raw_key
     skey = model_policy.sticky_scope(CONFIG, skey, model)
     pool = CONFIG.get("cred_pool")
     if pool is not None:
-        picked = pool.headers_for(skey, model, region=region, with_generation=True, tried=tried)
+        resources = request_resources.get()
+        picked = pool.headers_for(skey, model, region=region, with_generation=True, tried=tried,
+                                  with_capacity=resources is not None)
         if picked is None:
             until = pool.model_cooldown_until(model, region=region)
             if until:
                 t = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(until))
-                raise HTTPException(status_code=429, detail={"error": {
+                raise HTTPException(status_code=429,
+                                    headers={"Retry-After": str(max(1, math.ceil(until - time.time())))},
+                                    detail={"error": {
                     "message": f"模型 {model} 额度冷却中（全部凭证），预计 {t} 重置后恢复",
                     "type": "rate_limit_error"}})
             blocked = pool.model_block_until(model, region=region)
@@ -1555,6 +1604,8 @@ def _cred_for(payload: dict, model: str | None = None, *, region=None, tried=())
                                 detail={"error": {"message": "无可用凭证（未登录、目录/额度未就绪或全部熔断）",
                                                   "type": "auth_error"}})
         cm, headers = picked
+        if resources is not None:
+            resources.add(cm)
     else:
         cm = CONFIG["cred"]
         if cm is None or cm in {_cred_manager(item) for item in tried}:
@@ -1565,7 +1616,11 @@ def _cred_for(payload: dict, model: str | None = None, *, region=None, tried=())
     profile = profile_for_headers(headers)
     if not _in_region(profile, region):
         raise HTTPException(status_code=503, detail={"error": {"message": "未找到指定地域凭据", "type": "auth_error"}})
-    headers.update(_dynamic_request_headers(f"{profile}:{skey}" if skey else None))
+    if context is not None and context.scoped:
+        identity = account_key(profile, headers.get("X-User-Id"), headers.get("X-Enterprise-Id"))
+        headers["X-Conversation-ID"] = context.conversation_id(profile, identity)
+    else:
+        headers.update(_dynamic_request_headers(f"{profile}:{skey}" if skey else None))
     return cm, headers
 
 
@@ -1593,12 +1648,12 @@ def _note_cred_model_ok(cred, model: str | None) -> None:
         pool.note_model_ok(cm, model)
 
 
-def _note_cred_status(cred, status: int, model: str | None = None, raw: bytes = b""):
+def _note_cred_status(cred, status: int, model: str | None = None, raw: bytes = b"", *, retry_after=None):
     """Record generation-scoped authentication, quota and unsupported-model failures."""
     pool = CONFIG.get("cred_pool")
     if pool is not None and cred is not None:
         cm, generation = cred if isinstance(cred, tuple) else (cred, None)
-        pool.note_status(cm, status, model=model, raw=raw, generation=generation)
+        pool.note_status(cm, status, model=model, raw=raw, generation=generation, retry_after=retry_after)
 
 @app.get("/health")
 def health():
@@ -2254,8 +2309,28 @@ def _normalize_tool_choice(body):
     body["tools"], body["tool_choice"] = matches, "required"
 
 
-def _prepare_chat_body(body: dict, *, region=None) -> dict:
+def _bind_request_session(payload, body):
+    context = current_context()
+    if context is not None and context.scoped:
+        try:
+            context.bind_session(payload, body.get("messages"))
+        except SessionIdentifierError as error:
+            raise HTTPException(status_code=400, detail={"error": {"message": str(error),
+                                "type": "invalid_request_error", "param": "session_id"}}) from None
+        except (ValueError, TypeError, UnicodeError, RecursionError):
+            raise HTTPException(status_code=400, detail={"error": {"message": "invalid session input",
+                                "type": "invalid_request_error"}}) from None
+
+
+def _request_id():
+    context = current_context()
+    return context.request_id if context is not None else uuid.uuid4().hex
+
+
+def _prepare_chat_body(body: dict, *, region=None, session_payload=None) -> dict:
     """Normalize models, system messages, streaming, desensitization and payload budgets."""
+    if session_payload is not None:
+        _bind_request_session(session_payload, body)
     body = dict(body)
     body["model"] = model_policy.resolve(CONFIG, body.get("model", "auto"))
     guard_model(body["model"], region=region, resolved=True)
@@ -2362,14 +2437,14 @@ async def chat_completions(request: Request,
     # Forward only supported request fields.
     client_wants_stream = _client_wants_stream(payload)
     body = {k: payload[k] for k in PASSTHROUGH_BODY_KEYS if k in payload}
-    body = _prepare_chat_body(body)
+    body = await run_in_threadpool(_prepare_chat_body, body, session_payload=payload)
 
     # Record request metadata.
     model_name = payload.get("model", "auto")
     tool_names = [t.get("function", {}).get("name") for t in (payload.get("tools") or [])
                   if isinstance(t, dict)]
     last_user = _last_user_text(messages)
-    rid = os.urandom(4).hex()
+    rid = _request_id()
     _log(f"[{rid}] ▶ REQUEST {model_name} | stream={client_wants_stream} | msgs={len(messages)}"
          + (f" | tools={tool_names}" if tool_names else "")
          + (f" | last_user={_truncate(last_user, 60)!r}" if last_user else ""))
@@ -2571,6 +2646,22 @@ def _public_sse_line(line, model_name):
 @asynccontextmanager
 async def _backend_stream(url, headers, body, *, timeout=300, rid="", model_name="?"):
     started, opened = time.monotonic(), False
+    context = current_context()
+    if context is not None:
+        context.attempt = None
+
+    def attempt_headers():
+        if context is None:
+            return dict(headers)
+        attempt = context.start_attempt()
+        outgoing = context.attempt_headers(headers, attempt)
+        profile = profile_for_headers(headers)
+        observe_attempt("upstream_attempt", profile=profile, upstream_model=body.get("model"),
+                        credential=account_key(profile, headers.get("X-User-Id"), headers.get("X-Enterprise-Id")),
+                        conversation_id=outgoing.get("X-Conversation-ID"),
+                        upstream_request_id=outgoing.get("X-Request-ID"))
+        return outgoing
+
     def retry(error):
         """Record connection retries and flag possible billing after write timeouts."""
         timeout_on_write = isinstance(error, WRITE_TIMEOUT_TRANSPORT)
@@ -2580,8 +2671,11 @@ async def _backend_stream(url, headers, body, *, timeout=300, rid="", model_name
         _log(f"[{rid}] {'写超时重放' if timeout_on_write else '建连失败'}，重试 1/1 | {model_name}"
              f" | {_network_error_text(error)}{_replay_cost_note(error)}")
     try:
+        resources = request_resources.get()
+        clients = resources.clients if resources is not None and CONFIG.get("upstream_keepalive") else None
         async with open_backend_stream(url, headers, body, read_timeout=timeout, on_retry=retry,
-                                       retry_write_timeout=bool(CONFIG.get("retry_write_timeout"))) as response:
+                                       retry_write_timeout=bool(CONFIG.get("retry_write_timeout")),
+                                       clients=clients, headers_for_attempt=attempt_headers) as response:
             opened = True
             observe_attempt("upstream_http", status_code=response.status_code,
                             duration_ms=(time.monotonic() - started) * 1000)
@@ -2600,11 +2694,12 @@ def _safe_err_raw(raw: bytes, status: int) -> dict:
         return {"error": {"message": raw.decode("utf-8", "replace")[:500], "type": "upstream_error", "code": status}}
 
 
-def _check_upstream_status(status, raw, cred, model):
+def _check_upstream_status(status, raw, cred, model, *, headers=None):
     if status != 200:
+        retry_after = parse_retry_after((headers or {}).get("Retry-After"))
         if not is_filter_error(raw):
-            _note_cred_status(cred, status, model=model, raw=raw)
-        raise UpstreamHTTPError(status, raw)
+            _note_cred_status(cred, status, model=model, raw=raw, retry_after=retry_after)
+        raise UpstreamHTTPError(status, raw, retry_after=retry_after)
 
 
 def _upstream_failure(error, model_name, t0, rid):
@@ -2642,7 +2737,8 @@ async def _fetch_checked_chat(url, headers, body, model_name, rid, cred=None, *,
         rejection = None
         async with _backend_stream(url, headers, body, rid=rid, model_name=model_name) as response:
             if response.status_code != 200:
-                _check_upstream_status(response.status_code, await read_bounded_error(response), cred, body.get("model"))
+                _check_upstream_status(response.status_code, await read_bounded_error(response), cred, body.get("model"),
+                                       headers=response.headers)
             else:
                 _note_cred_model_ok(cred, body.get("model"))
             try:
@@ -2708,7 +2804,8 @@ async def _chat_sse_lines(url, headers, body, model_name, t0, rid, cred=None, *,
     budget = CONFIG["log_body_limit"] if CONFIG.get("log_path") else 0
     async with _backend_stream(url, headers, body, rid=rid, model_name=model_name) as response:
         if response.status_code != 200:
-            _check_upstream_status(response.status_code, await read_bounded_error(response), cred, body.get("model"))
+            _check_upstream_status(response.status_code, await read_bounded_error(response), cred, body.get("model"),
+                                   headers=response.headers)
         else:
             _note_cred_model_ok(cred, body.get("model"))
         async for line in response.aiter_lines():
@@ -2798,6 +2895,7 @@ class _StreamFailure(Exception):
         self.status = status
         self.raw = raw
         self.error = error
+        self.headers = error.headers if isinstance(error, UpstreamHTTPError) else None
         super().__init__(f"stream failed before first byte (HTTP {status})")
 
 
@@ -2915,10 +3013,11 @@ async def _stream_plan(payload, canonical, model_name, rid, t0, make, routed, cr
             first = await _preflight_stream(stream, model_name, t0, rid)
         except _StreamFailure as failure:
             await _close_stream(stream)   # Release the failed upstream connection.
+            release_credential(cred)
             recovered = observe_failure_seq()   # Recover only this failure sequence.
             tried.append(cred)
             limit = _failover_limit()
-            surface = HTTPException(status_code=failure.status,
+            surface = HTTPException(status_code=failure.status, headers=failure.headers,
                                     detail=_safe_err_raw(failure.raw, failure.status))
             if limit <= 0 or len(tried) > limit or not _failover_safe(failure.error, failure.raw):
                 raise surface from None
@@ -2963,11 +3062,13 @@ async def _routed_fetch(payload, canonical, model_name, rid, t0, fetch, routed, 
                 observe_recovery(recovered)
             return collected
         except (httpx.HTTPError, UpstreamResponseError) as error:
+            release_credential(cred)
             status, raw = _upstream_failure(error, model_name, t0, rid)
             recovered = observe_failure_seq()
             tried.append(cred)
             limit = _failover_limit()
-            surface = HTTPException(status_code=status, detail=_safe_err_raw(raw, status))
+            surface = HTTPException(status_code=status, detail=_safe_err_raw(raw, status),
+                                    headers=error.headers if isinstance(error, UpstreamHTTPError) else None)
             if limit <= 0 or len(tried) > limit or not _failover_safe(error, raw):
                 raise surface from None
             try:
@@ -3034,13 +3135,14 @@ async def create_response(request: Request,
     except Exception as e:
         raise HTTPException(status_code=400, detail={"error": {"message": f"request conversion error: {e}", "type": "invalid_request_error"}})
 
+    await run_in_threadpool(_bind_request_session, payload, chat_body)
     chat_body, projection_stats = project_responses_chat_body(
         chat_body, keep_tool_metadata=CONFIG.get("keep_tool_metadata", False))
-    chat_body = _prepare_chat_body(chat_body)
+    chat_body = await run_in_threadpool(_prepare_chat_body, chat_body)
 
     client_wants_stream = _client_wants_stream(payload)
     model_name = payload.get("model", "auto")
-    rid = os.urandom(4).hex()
+    rid = _request_id()
     _log(f"[{rid}] ▶ RESPONSES {model_name} | stream={client_wants_stream} | input_items={len(payload.get('input', []))}")
     _log(
         f"[{rid}] ── RESPONSES PROJECTION ── "
@@ -3085,7 +3187,8 @@ async def _nonstream_adapted(url, headers, body, model_name, t0, rid, cred, *, a
         converter.finish()
     except (httpx.HTTPError, UpstreamResponseError) as error:
         status, raw = _upstream_failure(error, model_name, t0, rid)
-        raise HTTPException(status_code=status, detail=_safe_err_raw(raw, status)) from None
+        raise HTTPException(status_code=status, detail=_safe_err_raw(raw, status),
+                            headers=error.headers if isinstance(error, UpstreamHTTPError) else None) from None
     except ClientHungUp:
         return _hungup_response(rid, model_name, t0)
     result = converter.get_nonstream_response()
@@ -3153,10 +3256,10 @@ async def create_message(request: Request,
     except Exception as e:
         raise HTTPException(status_code=400, detail={"error": {"message": f"request conversion error: {e}", "type": "invalid_request_error"}})
 
-    chat_body = _prepare_chat_body(chat_body)
+    chat_body = await run_in_threadpool(_prepare_chat_body, chat_body, session_payload=payload)
     model_name = payload.get("model", "auto")
     chat_messages = chat_body.get("messages", [])
-    rid = os.urandom(4).hex()
+    rid = _request_id()
     _log(f"[{rid}] ▶ ANTHROPIC {model_name} | msgs={len(chat_messages)} | anthropic_msgs={len(messages)}")
     # Keep blocking credential selection and refresh off the event loop.
     prepared = chat_body        # Preserve canonical input for routing policy checks.
@@ -3375,6 +3478,15 @@ def main():
     ap.add_argument("--max-concurrent", type=_nonnegative_int, metavar="N",
                     default=os.environ.get("CODEBUDDY2API_MAX_CONCURRENT", "64"),
                     help="推理端点并发上限（超出立即 503），默认 64；0 不限制")
+    ap.add_argument("--max-inflight-per-account", type=_nonnegative_int, metavar="N",
+                    default=os.environ.get("CODEBUDDY2API_MAX_INFLIGHT_PER_ACCOUNT", "0"),
+                    help="单账号在途上限，默认 0（不限制）；满载返回 503，不借容量切换到收费账号")
+    ap.add_argument("--upstream-keepalive", type=_boolean_arg, nargs="?", const=True,
+                    default=os.environ.get("CODEBUDDY2API_UPSTREAM_KEEPALIVE", "false"),
+                    help="按上游入口复用有界连接池，默认 false；重启生效，不改变超时或重放规则")
+    ap.add_argument("--request-context-mode", choices=("legacy", "scoped"),
+                    default=os.environ.get("CODEBUDDY2API_REQUEST_CONTEXT_MODE", "legacy"),
+                    help="请求上下文：legacy 保持旧会话头，scoped 启用显式会话与逐尝试追踪；默认 legacy")
     ap.add_argument("--log-body-limit", type=_nonnegative_int, metavar="BYTES",
                     default=os.environ.get("CODEBUDDY2API_LOG_BODY_LIMIT", "65536"),
                     help="每条正文日志的预览字节上限，默认 64 KiB；0 只记录摘要")
@@ -3404,7 +3516,8 @@ def main():
 
     for key in ("max_images", "image_policy", "max_request_bytes", "log_body_limit",
                 "tool_call_max_retry", "max_inbound_bytes", "max_collect_bytes", "max_concurrent",
-                "failover_max", "retry_write_timeout"):
+                "failover_max", "retry_write_timeout", "upstream_keepalive", "max_inflight_per_account",
+                "request_context_mode"):
         CONFIG[key] = getattr(args, key)
     CONFIG["api_key"] = args.api_key
     CONFIG["desensitize"] = args.desensitize
